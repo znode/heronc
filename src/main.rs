@@ -4,16 +4,19 @@ use std::{
 };
 
 use prost::Message;
-use zenoh::{config::Config, pubsub::Publisher};
+use zenoh::{config::Config, pubsub::Publisher, sample::Sample};
 
 use interfaces::{
     geometry_msgs::{
         Point, Pose, PoseWithCovariance, Quaternion, Twist, TwistWithCovariance, Vector3,
     },
     nav_msgs::Odometry,
+    sensor_msgs::{Image, PointCloud2, PointField, point_field},
     std_msgs::{Header, Time},
 };
-use webots::{Accelerometer, Compass, Gps, Gyro, InertialUnit, Robot, Sensor};
+use webots::{
+    Accelerometer, Camera, Compass, Gps, Gyro, InertialUnit, Lidar, Robot, Sensor, WbLidarPoint,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -39,11 +42,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await
         .unwrap();
 
-    let camera_rgb = Robot::camera("camera rgb");
-    camera_rgb.enable(TIME_STEP);
+    let camera_publisher = session
+        .declare_publisher(robot_name.to_string() + "/image")
+        .await
+        .unwrap();
 
-    let camera_depth = Robot::range_finder("camera depth");
-    camera_depth.enable(TIME_STEP);
+    let lidar_publisher = session
+        .declare_publisher(robot_name.to_string() + "/lidar")
+        .await
+        .unwrap();
 
     let left_motor = Robot::motor("left_motor");
     let right_motor = Robot::motor("right_motor");
@@ -54,6 +61,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     right_motor.set_velocity(0.1 * MAX_SPEED);
 
     let (accel, gyro, _compass, imu, gps) = odom_start(TIME_STEP);
+    let camera = camera_start(TIME_STEP);
+    let lidar = lidar_start(TIME_STEP);
 
     loop {
         if Robot::step(TIME_STEP) == -1 {
@@ -61,12 +70,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
 
-        odom_pub(&odom_publisher, &imu, &accel, &gyro, &gps, now).await?;
-        if let Ok(msg) = subscriber.recv_async().await {
-            match msg.key_expr() {
-                _ => println!("{}", msg.key_expr()),
+        tokio::select! {
+            msg = subscriber.recv_async() => {
+                if let Ok(msg) = msg {
+                    handle_msg(msg)
+                }
             }
-        }
+
+            _ = odom_pub(&odom_publisher, &imu, &accel, &gyro, &gps, now) => {}
+            _ = camera_pub(&camera_publisher, &camera, now) => {}
+            _ = lidar_pub(&lidar_publisher, &lidar, now) => {}
+        };
+
         // initialize motor speeds at 50% of MAX_SPEED.
         let left_speed = 0.5 * MAX_SPEED;
         let right_speed = 0.5 * MAX_SPEED;
@@ -148,8 +163,109 @@ async fn odom_pub<'a>(
             covariance: vec![],
         }),
     };
-    println!("{:?}", odom);
 
     publisher.put(odom.encode_to_vec()).await.unwrap();
     Ok(())
+}
+
+pub fn camera_start(sampling_period: i32) -> Camera {
+    let camera_rgb = Robot::camera("camera rgb");
+    camera_rgb.enable(sampling_period);
+
+    camera_rgb
+}
+
+async fn camera_pub<'a>(
+    publisher: &Publisher<'a>,
+    camera: &Camera,
+    now: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let image = Image {
+        header: Some(Header {
+            stamp: Some(Time {
+                sec: now.as_secs(),
+                nanosec: now.subsec_nanos(),
+            }),
+            frame_id: "camera".to_string(),
+        }),
+        height: camera.height() as u32,
+        width: camera.width() as u32,
+        encoding: "RGB888".to_string(),
+        is_bigendian: false,
+        step: camera.width() as u32,
+        data: camera.image()?.to_vec(),
+    };
+    publisher.put(image.encode_to_vec()).await.unwrap();
+
+    Ok(())
+}
+
+fn lidar_start(sampling_period: i32) -> Lidar {
+    let lidar = Robot::lidar("lidar");
+    lidar.enable(sampling_period);
+    lidar.enable_point_cloud();
+    println!(
+        "Lidar PointCloud enabled {}",
+        lidar.is_point_cloud_enabled()
+    );
+
+    lidar
+}
+
+async fn lidar_pub<'a>(
+    publisher: &Publisher<'a>,
+    lidar: &Lidar,
+    now: Duration,
+) -> Result<(), Box<dyn Error>> {
+    if !lidar.is_point_cloud_enabled() {
+        return Err("Lidar PointCloud is not enabled".into());
+    }
+    let point_step = std::mem::size_of::<WbLidarPoint>() as u32;
+
+    let pc = PointCloud2 {
+        header: Some(Header {
+            stamp: Some(Time {
+                sec: now.as_secs(),
+                nanosec: now.subsec_nanos(),
+            }),
+            frame_id: "lidar".to_string(),
+        }),
+        height: 1,
+        width: lidar.number_of_points() as u32,
+        fields: vec![
+            PointField {
+                name: "x".to_string(),
+                offset: 0,
+                datatype: point_field::DataType::Float32 as i32,
+                count: 1,
+            },
+            PointField {
+                name: "y".to_string(),
+                offset: 4,
+                datatype: point_field::DataType::Float32 as i32,
+                count: 1,
+            },
+            PointField {
+                name: "z".to_string(),
+                offset: 8,
+                datatype: point_field::DataType::Float32 as i32,
+                count: 1,
+            },
+        ],
+        is_bigendian: false,
+        point_step,
+        row_step: point_step * lidar.number_of_points() as u32,
+        data: unsafe { std::mem::transmute(lidar.point_cloud().to_vec()) },
+        is_dense: false,
+    };
+
+    publisher.put(pc.encode_to_vec()).await.unwrap();
+
+    Ok(())
+}
+
+fn handle_msg(msg: Sample) {
+    match msg.key_expr() {
+        _ => println!("{}", msg.key_expr()),
+    }
 }
