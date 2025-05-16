@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -15,15 +16,16 @@ use interfaces::{
     std_msgs::{Header, Time},
 };
 use webots::{
-    Accelerometer, Camera, Compass, Gps, Gyro, InertialUnit, Lidar, Robot, Sensor, WbLidarPoint,
+    Accelerometer, Camera, Compass, Gps, Gyro, InertialUnit, Lidar, Motor, Robot, Sensor,
+    WbLidarPoint,
 };
+
+const INFINITY: f64 = 1.0 / 0.0;
+const MAX_SPEED: f64 = 30.0;
+const TIME_STEP: i32 = 10;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    const INFINITY: f64 = 1.0 / 0.0;
-    const MAX_SPEED: f64 = 30.0;
-    const TIME_STEP: i32 = 64;
-
     // Initiate logging
     env_logger::init();
 
@@ -59,10 +61,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     left_motor.set_velocity(0.1 * MAX_SPEED);
     right_motor.set_velocity(0.1 * MAX_SPEED);
+    let left_motor = Arc::new(Mutex::new(left_motor));
+    let right_motor = Arc::new(Mutex::new(right_motor));
 
-    let (accel, gyro, _compass, imu, gps) = odom_start(TIME_STEP);
-    let camera = camera_start(TIME_STEP);
-    let lidar = lidar_start(TIME_STEP);
+    let (accel, gyro, _compass, imu, gps) = odom_start(20);
+    let camera = camera_start(40);
+    let lidar = lidar_start(100);
 
     loop {
         if Robot::step(TIME_STEP) == -1 {
@@ -73,7 +77,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             msg = subscriber.recv_async() => {
                 if let Ok(msg) = msg {
-                    handle_msg(msg)
+                    handle_msg(msg, (left_motor.clone(), right_motor.clone()))
                 }
             }
 
@@ -81,14 +85,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ = camera_pub(&camera_publisher, &camera, now) => {}
             _ = lidar_pub(&lidar_publisher, &lidar, now) => {}
         };
-
-        // initialize motor speeds at 50% of MAX_SPEED.
-        let left_speed = 0.5 * MAX_SPEED;
-        let right_speed = 0.5 * MAX_SPEED;
-
-        // write actuators inputs
-        left_motor.set_velocity(left_speed);
-        right_motor.set_velocity(right_speed);
     }
 
     Ok(())
@@ -264,8 +260,21 @@ async fn lidar_pub<'a>(
     Ok(())
 }
 
-fn handle_msg(msg: Sample) {
+fn handle_msg(msg: Sample, motor: (Arc<Mutex<Motor>>, Arc<Mutex<Motor>>)) {
+    let (left, right) = motor;
     match msg.key_expr() {
         _ => println!("{}", msg.key_expr()),
+    }
+
+    // initialize motor speeds at 50% of MAX_SPEED.
+    let left_speed = 0.5 * MAX_SPEED;
+    let right_speed = 0.5 * MAX_SPEED;
+
+    // write actuators inputs
+    if let Ok(left) = left.try_lock() {
+        left.set_velocity(left_speed);
+    }
+    if let Ok(right) = right.try_lock() {
+        right.set_velocity(right_speed);
     }
 }
