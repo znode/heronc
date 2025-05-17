@@ -21,7 +21,7 @@ use webots::{
 };
 
 const INFINITY: f64 = 1.0 / 0.0;
-const MAX_SPEED: f64 = 30.0;
+const MAX_SPEED: f64 = 10.0;
 const TIME_STEP: i32 = 10;
 
 #[tokio::main]
@@ -38,7 +38,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Declaring Subscriber on '{}'...", &robot_name);
 
-    let subscriber = session.declare_subscriber(robot_name).await.unwrap();
+    let subscriber = session
+        .declare_subscriber(robot_name.to_string() + "/twist")
+        .await
+        .unwrap();
     let odom_publisher = session
         .declare_publisher(robot_name.to_string() + "/odom")
         .await
@@ -77,7 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             msg = subscriber.recv_async() => {
                 if let Ok(msg) = msg {
-                    handle_msg(msg, (left_motor.clone(), right_motor.clone()))
+                    handle_msg(robot_name, msg, (left_motor.clone(), right_motor.clone()))
                 }
             }
 
@@ -260,21 +263,21 @@ async fn lidar_pub<'a>(
     Ok(())
 }
 
-fn handle_msg(msg: Sample, motor: (Arc<Mutex<Motor>>, Arc<Mutex<Motor>>)) {
+fn handle_msg(name: &str, msg: Sample, motor: (Arc<Mutex<Motor>>, Arc<Mutex<Motor>>)) {
     let (left, right) = motor;
-    match msg.key_expr() {
-        _ => println!("{}", msg.key_expr()),
-    }
-
-    // initialize motor speeds at 50% of MAX_SPEED.
-    let left_speed = 0.5 * MAX_SPEED;
-    let right_speed = 0.5 * MAX_SPEED;
-
-    // write actuators inputs
-    if let Ok(left) = left.try_lock() {
-        left.set_velocity(left_speed);
-    }
-    if let Ok(right) = right.try_lock() {
-        right.set_velocity(right_speed);
+    let topic = name.to_string() + "/twist";
+    if msg.key_expr().to_string() == topic {
+        let twist = Twist::decode(&*msg.payload().to_bytes()).unwrap();
+        if let Some(speed) = twist.linear {
+            // write actuators inputs
+            if let Ok(left) = left.try_lock() {
+                left.set_velocity(speed.x);
+            }
+            if let Ok(right) = right.try_lock() {
+                right.set_velocity(speed.y);
+            }
+        }
+    } else {
+        println!("{}", msg.key_expr())
     }
 }
