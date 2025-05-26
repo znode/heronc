@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use log::{debug, info, warn};
 use prost::Message;
 use zenoh::{config::Config, pubsub::Publisher, sample::Sample};
 
@@ -21,8 +22,8 @@ use webots::{
 };
 
 const INFINITY: f64 = 1.0 / 0.0;
-const MAX_SPEED: f64 = 10.0;
-const TIME_STEP: i32 = 10;
+const MAX_SPEED: f64 = 30.0;
+const TIME_STEP: i32 = 32;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -36,7 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let robot_name = Robot::name();
 
-    println!("Declaring Subscriber on '{}'...", &robot_name);
+    info!("Declaring Subscriber on '{}'...", &robot_name);
 
     let subscriber = session
         .declare_subscriber(robot_name.to_string() + "/twist")
@@ -61,9 +62,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let right_motor = Robot::motor("right_motor");
     left_motor.set_position(INFINITY);
     right_motor.set_position(INFINITY);
+    left_motor.set_velocity(0.0);
+    right_motor.set_velocity(0.0);
 
-    left_motor.set_velocity(0.1 * MAX_SPEED);
-    right_motor.set_velocity(0.1 * MAX_SPEED);
     let left_motor = Arc::new(Mutex::new(left_motor));
     let right_motor = Arc::new(Mutex::new(right_motor));
 
@@ -111,14 +112,15 @@ fn odom_start(sampling_period: i32) -> (Accelerometer, Gyro, Compass, InertialUn
 async fn odom_pub<'a>(
     publisher: &Publisher<'a>,
     imu: &InertialUnit,
-    acc: &Accelerometer,
+    _acc: &Accelerometer,
     gyro: &Gyro,
     gps: &Gps,
     now: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let p = gps.location();
     let q = imu.quaternion()?;
-    let la = acc.values()?;
+    let lv = gps.speeds();
+    // let la = acc.values()?;
     let av = gyro.values()?;
 
     let odom = Odometry {
@@ -149,9 +151,9 @@ async fn odom_pub<'a>(
         twist: Some(TwistWithCovariance {
             twist: Some(Twist {
                 linear: Some(Vector3 {
-                    x: la[0],
-                    y: la[1],
-                    z: la[2],
+                    x: lv[0],
+                    y: lv[1],
+                    z: lv[2],
                 }),
                 angular: Some(Vector3 {
                     x: av[0],
@@ -163,6 +165,7 @@ async fn odom_pub<'a>(
         }),
     };
 
+    debug!("{odom:?}");
     publisher.put(odom.encode_to_vec()).await.unwrap();
     Ok(())
 }
@@ -203,7 +206,7 @@ fn lidar_start(sampling_period: i32) -> Lidar {
     let lidar = Robot::lidar("lidar");
     lidar.enable(sampling_period);
     lidar.enable_point_cloud();
-    println!(
+    info!(
         "Lidar PointCloud enabled {}",
         lidar.is_point_cloud_enabled()
     );
@@ -265,19 +268,20 @@ async fn lidar_pub<'a>(
 
 fn handle_msg(name: &str, msg: Sample, motor: (Arc<Mutex<Motor>>, Arc<Mutex<Motor>>)) {
     let (left, right) = motor;
-    let topic = name.to_string() + "/twist";
-    if msg.key_expr().to_string() == topic {
+    let cmd_vel = name.to_string() + "/cmd_vel";
+    if msg.key_expr().to_string() == cmd_vel {
         let twist = Twist::decode(&*msg.payload().to_bytes()).unwrap();
         if let Some(speed) = twist.linear {
+            debug!("Speed {:?}", speed);
             // write actuators inputs
             if let Ok(left) = left.try_lock() {
-                left.set_velocity(speed.x);
+                left.set_velocity(speed.x.clamp(-MAX_SPEED, MAX_SPEED));
             }
             if let Ok(right) = right.try_lock() {
-                right.set_velocity(speed.y);
+                right.set_velocity(speed.y.clamp(-MAX_SPEED, MAX_SPEED));
             }
         }
     } else {
-        println!("{}", msg.key_expr())
+        warn!("{}", msg.key_expr())
     }
 }
