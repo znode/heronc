@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Declaring Subscriber on '{}'...", &robot_name);
 
     let subscriber = session
-        .declare_subscriber(robot_name.to_string() + "/twist")
+        .declare_subscriber(robot_name.to_string() + "/cmd_vel")
         .await
         .unwrap();
     let odom_publisher = session
