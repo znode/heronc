@@ -1,11 +1,11 @@
 [package]
-name = "heron_controller"
+name = "heronc"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-webots = { path = "../webots-rs" }
-interfaces = { path = "../interfaces" }
+webots = { git = "https://github.com/znode/webots-rs", branch = "main" }
+interfaces = { git = "https://github.com/znode/interfaces", branch = "main" }
 zenoh = "1.6.1"
 prost = "0.13.5"
 env_logger = "0.11.8"
