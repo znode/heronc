@@ -1,97 +1,98 @@
-use std::{
-    error::Error,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
-};
+use std::{error::Error, time::Duration};
 
-use log::{debug, info, warn};
+use chrono::{DateTime, Local};
+use log::{debug, error, info, warn};
 use prost::Message;
-use zenoh::{config::Config, pubsub::Publisher, sample::Sample};
+use tokio::task::JoinSet;
+use zenoh::{Session, config::Config, pubsub::Publisher};
 
 use interfaces::{
     geometry_msgs::{
-        Point, Pose, PoseWithCovariance, Quaternion, Twist, TwistWithCovariance, Vector3,
+        Point, Pose, PoseWithCovariance, Quaternion, Twist, TwistWithCovariance, Vector3, Wrench,
     },
     nav_msgs::Odometry,
     sensor_msgs::{Image, PointCloud2, PointField, point_field},
     std_msgs::{Header, Time},
 };
 use webots::{
-    Accelerometer, Camera, Compass, Gps, Gyro, InertialUnit, Lidar, Motor, Robot, Sensor,
-    WbLidarPoint,
+    Accelerometer, Camera, Compass, Gps, Gyro, InertialUnit, Lidar, Robot, Sensor, WbLidarPoint,
 };
 
 const INFINITY: f64 = 1.0 / 0.0;
 const MAX_SPEED: f64 = 30.0;
 const TIME_STEP: i32 = 32;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // Initiate logging
-    env_logger::init();
+async fn handle_message(session: Session, topic: String) {
+    let subscriber = session.declare_subscriber(topic.as_str()).await.unwrap();
 
-    Robot::init();
+    let left = Robot::motor("left_motor");
+    let right = Robot::motor("right_motor");
 
-    let config = Config::default();
-    let session = zenoh::open(config).await.unwrap();
-
-    let robot_name = Robot::name();
-
-    info!("Declaring Subscriber on '{}'...", &robot_name);
-
-    let subscriber = session
-        .declare_subscriber(robot_name.to_string() + "/cmd_vel")
-        .await
-        .unwrap();
-    let odom_publisher = session
-        .declare_publisher(robot_name.to_string() + "/odom")
-        .await
-        .unwrap();
-
-    let camera_publisher = session
-        .declare_publisher(robot_name.to_string() + "/image")
-        .await
-        .unwrap();
-
-    let lidar_publisher = session
-        .declare_publisher(robot_name.to_string() + "/lidar")
-        .await
-        .unwrap();
-
-    let left_motor = Robot::motor("left_motor");
-    let right_motor = Robot::motor("right_motor");
-    left_motor.set_position(INFINITY);
-    right_motor.set_position(INFINITY);
-    left_motor.set_velocity(0.0);
-    right_motor.set_velocity(0.0);
-
-    let left_motor = Arc::new(Mutex::new(left_motor));
-    let right_motor = Arc::new(Mutex::new(right_motor));
-
-    let (accel, gyro, _compass, imu, gps) = odom_start(20);
-    let camera = camera_start(40);
-    let lidar = lidar_start(100);
-
-    loop {
-        if Robot::step(TIME_STEP) == -1 {
-            break;
-        }
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
-
-        tokio::select! {
-            msg = subscriber.recv_async() => {
-                if let Ok(msg) = msg {
-                    handle_msg(robot_name, msg, (left_motor.clone(), right_motor.clone()))
+    while let Ok(msg) = subscriber.recv_async().await {
+        match msg.key_expr().as_str().split('/').last() {
+            Some("cmd_vel") => {
+                let twist = Twist::decode(&*msg.payload().to_bytes()).unwrap();
+                if let Some(speed) = twist.linear {
+                    debug!("Speed {:?}", speed);
+                    // write actuators inputs
+                    left.set_velocity(speed.x.clamp(-MAX_SPEED, MAX_SPEED));
+                    right.set_velocity(speed.y.clamp(-MAX_SPEED, MAX_SPEED));
                 }
             }
-
-            _ = odom_pub(&odom_publisher, &imu, &accel, &gyro, &gps, now) => {}
-            _ = camera_pub(&camera_publisher, &camera, now) => {}
-            _ = lidar_pub(&lidar_publisher, &lidar, now) => {}
-        };
+            Some("cmd_force") => {
+                let wrench = Wrench::decode(&*msg.payload().to_bytes()).unwrap();
+                if let Some(force) = wrench.force {
+                    debug!("force {force:?}");
+                    // write actuators inputs
+                    left.set_force(force.x.clamp(-left.max_force(), left.max_force()));
+                    right.set_force(force.y.clamp(-right.max_force(), right.max_force()));
+                }
+            }
+            _ => warn!("Unknown topic: {}", msg.key_expr()),
+        }
     }
+}
 
-    Ok(())
+async fn enable_odom(session: Session, period: i32, topic: String) {
+    let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
+    let (accel, gyro, _compass, imu, gps) = odom_start(period);
+
+    loop {
+        let now = chrono::Local::now();
+        if let Err(err) = odom_pub(&publisher, &imu, &accel, &gyro, &gps, now).await {
+            error!("Error publishing odom data: {}", err);
+        }
+
+        tokio::time::sleep(Duration::from_millis(period as u64)).await;
+    }
+}
+
+async fn enable_camera(session: Session, period: i32, topic: String) {
+    let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
+    let camera = camera_start(period);
+
+    loop {
+        let now = chrono::Local::now();
+        if let Err(err) = camera_pub(&publisher, &camera, now).await {
+            error!("Error publishing camera data: {}", err);
+        }
+
+        tokio::time::sleep(Duration::from_millis(period as u64)).await;
+    }
+}
+
+async fn enable_lidar(session: Session, period: i32, topic: String) {
+    let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
+    let lidar = lidar_start(period);
+
+    loop {
+        let now = chrono::Local::now();
+        if let Err(err) = lidar_pub(&publisher, &lidar, now).await {
+            error!("Error publishing lidar data: {}", err);
+        }
+
+        tokio::time::sleep(Duration::from_millis(period as u64)).await;
+    }
 }
 
 fn odom_start(sampling_period: i32) -> (Accelerometer, Gyro, Compass, InertialUnit, Gps) {
@@ -115,7 +116,7 @@ async fn odom_pub<'a>(
     _acc: &Accelerometer,
     gyro: &Gyro,
     gps: &Gps,
-    now: Duration,
+    now: DateTime<Local>,
 ) -> Result<(), Box<dyn Error>> {
     let p = gps.location();
     let q = imu.quaternion()?;
@@ -126,8 +127,8 @@ async fn odom_pub<'a>(
     let odom = Odometry {
         header: Some(Header {
             stamp: Some(Time {
-                sec: now.as_secs(),
-                nanosec: now.subsec_nanos(),
+                sec: now.timestamp() as u64,
+                nanosec: now.timestamp_subsec_nanos(),
             }),
             frame_id: "robot".to_string(),
         }),
@@ -180,13 +181,13 @@ pub fn camera_start(sampling_period: i32) -> Camera {
 async fn camera_pub<'a>(
     publisher: &Publisher<'a>,
     camera: &Camera,
-    now: Duration,
+    now: DateTime<Local>,
 ) -> Result<(), Box<dyn Error>> {
     let image = Image {
         header: Some(Header {
             stamp: Some(Time {
-                sec: now.as_secs(),
-                nanosec: now.subsec_nanos(),
+                sec: now.timestamp() as u64,
+                nanosec: now.timestamp_subsec_nanos(),
             }),
             frame_id: "camera".to_string(),
         }),
@@ -217,7 +218,7 @@ fn lidar_start(sampling_period: i32) -> Lidar {
 async fn lidar_pub<'a>(
     publisher: &Publisher<'a>,
     lidar: &Lidar,
-    now: Duration,
+    now: DateTime<Local>,
 ) -> Result<(), Box<dyn Error>> {
     if !lidar.is_point_cloud_enabled() {
         return Err("Lidar PointCloud is not enabled".into());
@@ -227,8 +228,8 @@ async fn lidar_pub<'a>(
     let pc = PointCloud2 {
         header: Some(Header {
             stamp: Some(Time {
-                sec: now.as_secs(),
-                nanosec: now.subsec_nanos(),
+                sec: now.timestamp() as u64,
+                nanosec: now.timestamp_subsec_nanos(),
             }),
             frame_id: "lidar".to_string(),
         }),
@@ -257,7 +258,10 @@ async fn lidar_pub<'a>(
         is_bigendian: false,
         point_step,
         row_step: point_step * lidar.number_of_points() as u32,
-        data: unsafe { std::mem::transmute(lidar.point_cloud().to_vec()) },
+        data: unsafe {
+            //FIXME: Use a more efficient and safety conversion method
+            std::mem::transmute::<Vec<webots::WbLidarPoint>, Vec<u8>>(lidar.point_cloud().to_vec())
+        },
         is_dense: false,
     };
 
@@ -266,22 +270,70 @@ async fn lidar_pub<'a>(
     Ok(())
 }
 
-fn handle_msg(name: &str, msg: Sample, motor: (Arc<Mutex<Motor>>, Arc<Mutex<Motor>>)) {
-    let (left, right) = motor;
-    let cmd_vel = name.to_string() + "/cmd_vel";
-    if msg.key_expr().to_string() == cmd_vel {
-        let twist = Twist::decode(&*msg.payload().to_bytes()).unwrap();
-        if let Some(speed) = twist.linear {
-            debug!("Speed {:?}", speed);
-            // write actuators inputs
-            if let Ok(left) = left.try_lock() {
-                left.set_velocity(speed.x.clamp(-MAX_SPEED, MAX_SPEED));
-            }
-            if let Ok(right) = right.try_lock() {
-                right.set_velocity(speed.y.clamp(-MAX_SPEED, MAX_SPEED));
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() {
+    // Initiate logging
+    env_logger::init();
+
+    Robot::init();
+    let mut engine = JoinSet::<()>::new();
+
+    let config = Config::default();
+    let session = zenoh::open(config).await.unwrap();
+
+    let robot_name = Robot::name();
+
+    info!("Declaring Subscriber on '{}'...", &robot_name);
+
+    engine.spawn(handle_message(
+        session.clone(),
+        robot_name.to_string() + "/cmd_vel",
+    ));
+    engine.spawn(handle_message(
+        session.clone(),
+        robot_name.to_string() + "/cmd_force",
+    ));
+
+    engine.spawn(enable_odom(
+        session.clone(),
+        20,
+        robot_name.to_string() + "/odom",
+    ));
+
+    engine.spawn(enable_camera(
+        session.clone(),
+        40,
+        robot_name.to_string() + "/image",
+    ));
+
+    engine.spawn(enable_lidar(
+        session.clone(),
+        100,
+        robot_name.to_string() + "/pointcloud",
+    ));
+
+    engine.spawn(async move {
+        loop {
+            if Robot::step(TIME_STEP) == -1 {
+                break;
             }
         }
-    } else {
-        warn!("{}", msg.key_expr())
+        error!("Robot step failed");
+    });
+
+    let left_motor = Robot::motor("left_motor");
+    let right_motor = Robot::motor("right_motor");
+    left_motor.set_position(INFINITY);
+    right_motor.set_position(INFINITY);
+    left_motor.set_velocity(0.0);
+    right_motor.set_velocity(0.0);
+
+    while let Some(res) = engine.join_next_with_id().await {
+        match res {
+            Ok((id, _)) => {
+                info!("Task {id} completed");
+            }
+            Err(err) => error!("Error joining task: {}", err),
+        }
     }
 }
