@@ -19,8 +19,6 @@ use webots::{
 };
 
 const INFINITY: f64 = 1.0 / 0.0;
-const MAX_SPEED: f64 = 30.0;
-const TIME_STEP: i32 = 32;
 
 async fn handle_message(session: Session, topic: String) {
     let subscriber = session.declare_subscriber(topic.as_str()).await.unwrap();
@@ -35,8 +33,8 @@ async fn handle_message(session: Session, topic: String) {
                 if let Some(speed) = twist.linear {
                     debug!("Speed {:?}", speed);
                     // write actuators inputs
-                    left.set_velocity(speed.x.clamp(-MAX_SPEED, MAX_SPEED));
-                    right.set_velocity(speed.y.clamp(-MAX_SPEED, MAX_SPEED));
+                    left.set_velocity(speed.x.clamp(-left.max_velocity(), left.max_velocity()));
+                    right.set_velocity(speed.y.clamp(-right.max_velocity(), right.max_velocity()));
                 }
             }
             Some("cmd_force") => {
@@ -313,8 +311,10 @@ async fn main() {
     ));
 
     engine.spawn(async move {
+        let time_step = Robot::basic_time_step();
+        info!("Robot basic time step: {}", time_step);
         loop {
-            if Robot::step(TIME_STEP) == -1 {
+            if Robot::step(time_step as i32) == -1 {
                 break;
             }
         }
