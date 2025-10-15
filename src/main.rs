@@ -313,10 +313,8 @@ async fn main() {
     engine.spawn(async move {
         let time_step = Robot::basic_time_step();
         info!("Robot basic time step: {}", time_step);
-        loop {
-            if Robot::step(time_step as i32) == -1 {
-                break;
-            }
+        while Robot::step(time_step as i32) != -1 {
+            //
         }
         error!("Robot step failed");
     });
