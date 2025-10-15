@@ -14,9 +14,7 @@ use interfaces::{
     sensor_msgs::{Image, PointCloud2, PointField, point_field},
     std_msgs::{Header, Time},
 };
-use webots::{
-    Accelerometer, Camera, Compass, Gps, Gyro, InertialUnit, Lidar, Robot, Sensor, WbLidarPoint,
-};
+use webots::{Accelerometer, Camera, Gps, Gyro, InertialUnit, Lidar, Robot, Sensor, WbLidarPoint};
 
 const INFINITY: f64 = 1.0 / 0.0;
 
@@ -53,11 +51,18 @@ async fn handle_message(session: Session, topic: String) {
 
 async fn enable_odom(session: Session, period: i32, topic: String) {
     let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
-    let (accel, gyro, _compass, imu, gps) = odom_start(period);
+    let imu = Robot::inertial_unit("imu inertial_unit");
+    let accelerometer = Robot::accelerometer("imu accelerometer");
+    let gyro = Robot::gyro("imu gyro");
+    let gps = Robot::gps("gps");
+    imu.enable(period);
+    accelerometer.enable(period);
+    gyro.enable(period);
+    gps.enable(period);
 
     loop {
         let now = chrono::Local::now();
-        if let Err(err) = odom_pub(&publisher, &imu, &accel, &gyro, &gps, now).await {
+        if let Err(err) = odom_pub(&publisher, &imu, &accelerometer, &gyro, &gps, now).await {
             error!("Error publishing odom data: {}", err);
         }
 
@@ -67,7 +72,8 @@ async fn enable_odom(session: Session, period: i32, topic: String) {
 
 async fn enable_camera(session: Session, period: i32, topic: String) {
     let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
-    let camera = camera_start(period);
+    let camera = Robot::camera("camera rgb");
+    camera.enable(period);
 
     loop {
         let now = chrono::Local::now();
@@ -81,7 +87,13 @@ async fn enable_camera(session: Session, period: i32, topic: String) {
 
 async fn enable_lidar(session: Session, period: i32, topic: String) {
     let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
-    let lidar = lidar_start(period);
+    let lidar = Robot::lidar("lidar");
+    lidar.enable(period);
+    lidar.enable_point_cloud();
+    info!(
+        "Lidar PointCloud enabled {}",
+        lidar.is_point_cloud_enabled()
+    );
 
     loop {
         let now = chrono::Local::now();
@@ -91,21 +103,6 @@ async fn enable_lidar(session: Session, period: i32, topic: String) {
 
         tokio::time::sleep(Duration::from_millis(period as u64)).await;
     }
-}
-
-fn odom_start(sampling_period: i32) -> (Accelerometer, Gyro, Compass, InertialUnit, Gps) {
-    // Motion and Location
-    let accelerometer = Robot::accelerometer("imu accelerometer");
-    accelerometer.enable(sampling_period);
-    let gyro = Robot::gyro("imu gyro");
-    gyro.enable(sampling_period);
-    let compass = Robot::compass("imu compass");
-    compass.enable(sampling_period);
-    let imu = Robot::inertial_unit("imu inertial_unit");
-    imu.enable(sampling_period);
-    let gps = Robot::gps("gps");
-    gps.enable(sampling_period);
-    (accelerometer, gyro, compass, imu, gps)
 }
 
 async fn odom_pub<'a>(
@@ -169,13 +166,6 @@ async fn odom_pub<'a>(
     Ok(())
 }
 
-pub fn camera_start(sampling_period: i32) -> Camera {
-    let camera_rgb = Robot::camera("camera rgb");
-    camera_rgb.enable(sampling_period);
-
-    camera_rgb
-}
-
 async fn camera_pub<'a>(
     publisher: &Publisher<'a>,
     camera: &Camera,
@@ -199,18 +189,6 @@ async fn camera_pub<'a>(
     publisher.put(image.encode_to_vec()).await.unwrap();
 
     Ok(())
-}
-
-fn lidar_start(sampling_period: i32) -> Lidar {
-    let lidar = Robot::lidar("lidar");
-    lidar.enable(sampling_period);
-    lidar.enable_point_cloud();
-    info!(
-        "Lidar PointCloud enabled {}",
-        lidar.is_point_cloud_enabled()
-    );
-
-    lidar
 }
 
 async fn lidar_pub<'a>(
