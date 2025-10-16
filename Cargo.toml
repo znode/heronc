@@ -7,7 +7,7 @@ edition = "2024"
 webots = { git = "https://github.com/znode/webots-rs", branch = "main" }
 interfaces = { git = "https://github.com/znode/interfaces", branch = "main" }
 zenoh = "1.6.1"
-prost = "0.13.5"
+prost = "0.14.1"
 env_logger = "0.11.8"
 tokio = "1.48.0"
 log = "0.4.28"
