@@ -1,11 +1,4 @@
-use std::{error::Error, time::Duration};
-
 use chrono::{DateTime, Local};
-use log::{debug, error, info, warn};
-use prost::Message;
-use tokio::task::JoinSet;
-use zenoh::{Session, config::Config, pubsub::Publisher};
-
 use interfaces::{
     geometry_msgs::{
         Point, Pose, PoseWithCovariance, Quaternion, Twist, TwistWithCovariance, Vector3, Wrench,
@@ -14,9 +7,12 @@ use interfaces::{
     sensor_msgs::{Image, PointCloud2, PointField, point_field},
     std_msgs::{Header, Time},
 };
+use log::{debug, error, info, trace, warn};
+use prost::Message;
+use std::error::Error;
+use tokio::task::JoinSet;
 use webots::{Accelerometer, Camera, Gps, Gyro, InertialUnit, Lidar, Robot, Sensor, WbLidarPoint};
-
-const INFINITY: f64 = 1.0 / 0.0;
+use zenoh::{Session, config::Config, pubsub::Publisher};
 
 async fn handle_message(session: Session, topic: String) {
     let subscriber = session.declare_subscriber(topic.as_str()).await.unwrap();
@@ -25,23 +21,34 @@ async fn handle_message(session: Session, topic: String) {
     let right = Robot::motor("right_motor");
 
     while let Ok(msg) = subscriber.recv_async().await {
-        match msg.key_expr().as_str().split('/').last() {
+        match msg.key_expr().as_str().split('/').next_back() {
             Some("cmd_vel") => {
-                let twist = Twist::decode(&*msg.payload().to_bytes()).unwrap();
-                if let Some(speed) = twist.linear {
-                    debug!("Speed {:?}", speed);
-                    // write actuators inputs
+                if let Ok(twist) = Twist::decode(&*msg.payload().to_bytes())
+                    && let Some(speed) = twist.linear
+                {
+                    debug!("speed {:?}", speed);
+                    left.set_position(f64::INFINITY);
+                    right.set_position(f64::INFINITY);
                     left.set_velocity(speed.x.clamp(-left.max_velocity(), left.max_velocity()));
                     right.set_velocity(speed.y.clamp(-right.max_velocity(), right.max_velocity()));
                 }
             }
             Some("cmd_force") => {
-                let wrench = Wrench::decode(&*msg.payload().to_bytes()).unwrap();
-                if let Some(force) = wrench.force {
+                if let Ok(wrench) = Wrench::decode(&*msg.payload().to_bytes())
+                    && let Some(force) = wrench.force
+                {
                     debug!("force {force:?}");
-                    // write actuators inputs
                     left.set_force(force.x.clamp(-left.max_force(), left.max_force()));
                     right.set_force(force.y.clamp(-right.max_force(), right.max_force()));
+                }
+            }
+            Some("cmd_pos") => {
+                if let Ok(twist) = Twist::decode(&*msg.payload().to_bytes())
+                    && let Some(pos) = twist.linear
+                {
+                    debug!("position {pos:?}");
+                    left.set_force(pos.x.clamp(-left.max_position(), left.max_position()));
+                    right.set_force(pos.y.clamp(-right.max_position(), right.max_position()));
                 }
             }
             _ => warn!("Unknown topic: {}", msg.key_expr()),
@@ -49,8 +56,44 @@ async fn handle_message(session: Session, topic: String) {
     }
 }
 
-async fn enable_odom(session: Session, period: i32, topic: String) {
-    let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
+async fn handle_state(session: Session, robot_name: &str, time_step: i32) {
+    let podom = session
+        .declare_publisher(robot_name.to_string() + "/odom")
+        .await
+        .unwrap();
+    let pcam = session
+        .declare_publisher(robot_name.to_string() + "/image")
+        .await
+        .unwrap();
+    let plidar = session
+        .declare_publisher(robot_name.to_string() + "/pointcloud")
+        .await
+        .unwrap();
+    let odom = enable_odom(20);
+    let camera = enable_camera(40);
+    let lidar = enable_lidar(100);
+
+    Robot::step(time_step);
+
+    while Robot::step_begin(time_step) != -1 {
+        let now = chrono::Local::now();
+        if let Err(err) = odom_pub(&podom, &odom, now).await {
+            error!("Error publishing odom data: {}", err);
+        }
+        if let Err(err) = camera_pub(&pcam, &camera, now).await {
+            error!("Error publishing camera data: {}", err);
+        }
+        if let Err(err) = lidar_pub(&plidar, &lidar, now).await {
+            error!("Error publishing lidar data: {}", err);
+        }
+
+        Robot::step_end();
+        trace!("Robot step......")
+    }
+    error!("Robot step failed");
+}
+
+fn enable_odom(period: i32) -> (Accelerometer, Gyro, Gps, InertialUnit) {
     let imu = Robot::inertial_unit("imu inertial_unit");
     let accelerometer = Robot::accelerometer("imu accelerometer");
     let gyro = Robot::gyro("imu gyro");
@@ -60,33 +103,16 @@ async fn enable_odom(session: Session, period: i32, topic: String) {
     gyro.enable(period);
     gps.enable(period);
 
-    loop {
-        let now = chrono::Local::now();
-        if let Err(err) = odom_pub(&publisher, &imu, &accelerometer, &gyro, &gps, now).await {
-            error!("Error publishing odom data: {}", err);
-        }
-
-        tokio::time::sleep(Duration::from_millis(period as u64)).await;
-    }
+    (accelerometer, gyro, gps, imu)
 }
 
-async fn enable_camera(session: Session, period: i32, topic: String) {
-    let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
+fn enable_camera(period: i32) -> Camera {
     let camera = Robot::camera("camera rgb");
     camera.enable(period);
-
-    loop {
-        let now = chrono::Local::now();
-        if let Err(err) = camera_pub(&publisher, &camera, now).await {
-            error!("Error publishing camera data: {}", err);
-        }
-
-        tokio::time::sleep(Duration::from_millis(period as u64)).await;
-    }
+    camera
 }
 
-async fn enable_lidar(session: Session, period: i32, topic: String) {
-    let publisher = session.declare_publisher(topic.as_str()).await.unwrap();
+fn enable_lidar(period: i32) -> Lidar {
     let lidar = Robot::lidar("lidar");
     lidar.enable(period);
     lidar.enable_point_cloud();
@@ -94,25 +120,15 @@ async fn enable_lidar(session: Session, period: i32, topic: String) {
         "Lidar PointCloud enabled {}",
         lidar.is_point_cloud_enabled()
     );
-
-    loop {
-        let now = chrono::Local::now();
-        if let Err(err) = lidar_pub(&publisher, &lidar, now).await {
-            error!("Error publishing lidar data: {}", err);
-        }
-
-        tokio::time::sleep(Duration::from_millis(period as u64)).await;
-    }
+    lidar
 }
 
 async fn odom_pub<'a>(
     publisher: &Publisher<'a>,
-    imu: &InertialUnit,
-    _acc: &Accelerometer,
-    gyro: &Gyro,
-    gps: &Gps,
+    odom: &(Accelerometer, Gyro, Gps, InertialUnit),
     now: DateTime<Local>,
 ) -> Result<(), Box<dyn Error>> {
+    let (_acc, gyro, gps, imu) = odom;
     let p = gps.location();
     let q = imu.quaternion()?;
     let lv = gps.speeds();
@@ -162,7 +178,9 @@ async fn odom_pub<'a>(
     };
 
     debug!("{odom:?}");
-    publisher.put(odom.encode_to_vec()).await.unwrap();
+    if let Err(e) = publisher.put(odom.encode_to_vec()).await {
+        error!("Failed to publish odometry: {}", e);
+    }
     Ok(())
 }
 
@@ -186,7 +204,9 @@ async fn camera_pub<'a>(
         step: camera.width() as u32,
         data: camera.image()?.to_vec(),
     };
-    publisher.put(image.encode_to_vec()).await.unwrap();
+    if let Err(e) = publisher.put(image.encode_to_vec()).await {
+        error!("Failed to publish camera image: {}", e);
+    }
 
     Ok(())
 }
@@ -241,7 +261,9 @@ async fn lidar_pub<'a>(
         is_dense: false,
     };
 
-    publisher.put(pc.encode_to_vec()).await.unwrap();
+    if let Err(e) = publisher.put(pc.encode_to_vec()).await {
+        error!("Failed to publish point cloud: {}", e);
+    }
 
     Ok(())
 }
@@ -261,6 +283,8 @@ async fn main() {
 
     info!("Declaring Subscriber on '{}'...", &robot_name);
 
+    let time_step = Robot::basic_time_step() as i32;
+    info!("Robot basic time step: {}", time_step);
     engine.spawn(handle_message(
         session.clone(),
         robot_name.to_string() + "/cmd_vel",
@@ -270,46 +294,16 @@ async fn main() {
         robot_name.to_string() + "/cmd_force",
     ));
 
-    engine.spawn(enable_odom(
-        session.clone(),
-        20,
-        robot_name.to_string() + "/odom",
-    ));
-
-    engine.spawn(enable_camera(
-        session.clone(),
-        40,
-        robot_name.to_string() + "/image",
-    ));
-
-    engine.spawn(enable_lidar(
-        session.clone(),
-        100,
-        robot_name.to_string() + "/pointcloud",
-    ));
-
-    engine.spawn(async move {
-        let time_step = Robot::basic_time_step();
-        info!("Robot basic time step: {}", time_step);
-        while Robot::step(time_step as i32) != -1 {
-            //
-        }
-        error!("Robot step failed");
-    });
-
-    let left_motor = Robot::motor("left_motor");
-    let right_motor = Robot::motor("right_motor");
-    left_motor.set_position(INFINITY);
-    right_motor.set_position(INFINITY);
-    left_motor.set_velocity(0.0);
-    right_motor.set_velocity(0.0);
+    engine.spawn(handle_state(session.clone(), robot_name, time_step));
 
     while let Some(res) = engine.join_next_with_id().await {
         match res {
             Ok((id, _)) => {
-                info!("Task {id} completed");
+                info!("Task {} completed", id);
             }
-            Err(err) => error!("Error joining task: {}", err),
+            Err(err) => {
+                error!("Task failed: {}", err);
+            }
         }
     }
 }

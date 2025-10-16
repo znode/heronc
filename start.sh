@@ -6,7 +6,7 @@ export DYLD_LIBRARY_PATH=/Volumes/Node/Applications/Webots.app/Contents/lib/cont
 # /Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller --protocol=tcp --ip-address=192.168.2.105 --robot-name=heron_3  ./target/release/heronc &
 # /Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller --protocol=tcp --ip-address=192.168.2.105 --robot-name=heron_4  ./target/release/heronc
 
-/Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller  --robot-name=heron_1  ./target/release/heronc &
+RUST_LOG=info /Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller  --robot-name=heron_1  ./target/release/heronc &
 /Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller  --robot-name=heron_2  ./target/release/heronc &
 /Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller  --robot-name=heron_3  ./target/release/heronc &
 /Volumes/Node/Applications/Webots.app/Contents/MacOS/webots-controller  --robot-name=heron_4  ./target/release/heronc
