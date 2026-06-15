@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-webots = { git = "https://github.com/znode/webots-rs", branch = "main" }
-interfaces = { git = "https://github.com/znode/interfaces", branch = "main" }
-zenoh = "1.6.1"
+clap = { version = "4.6", features = ["derive"] }
+webots = { path = "../webots-rs" }
+hiroz = { git = "https://github.com/ZettaScaleLabs/hiroz.git"}
+hiroz-msgs = { git = "https://github.com/ZettaScaleLabs/hiroz.git" }
 prost = "0.14.1"
-env_logger = "0.11.8"
-tokio = "1.48.0"
-log = "0.4.28"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.48.0", features = ["full"] }
 chrono = "0.4.42"
+anyhow = "1.0.102"
